@@ -85,7 +85,7 @@ target_sources(${PROJECT_NAME} PRIVATE
 	${imgui_SOURCE_DIR}/imgui_demo.cpp
 )
 
-# Compile shaders
+# компиляция шейдеров
 find_program(GLSLC_FOUND glslc)
 if(GLSLC_FOUND)
 	set(_SHADER_BINARIES)
@@ -99,14 +99,13 @@ if(GLSLC_FOUND)
 			OUTPUT ${SHADER_BINARY_PATH}
 			COMMAND ${GLSLC_FOUND} ${SHADER_SOURCE} -o ${SHADER_BINARY_PATH}
 			DEPENDS ${SHADER_SOURCE}
-			COMMENT "Compiling ${SHADER_FILE} shader"
+			COMMENT "компиляция шейдера ${SHADER_FILE}"
 		)
 
 		list(APPEND _SHADER_BINARIES ${SHADER_BINARY_PATH})
 	endmacro()
 
-	# To compile shader file, use compile_shader function with a file name
-	# of a shader inside shaders directory. See example below:
+	# исходные файлы GLSL находятся в папке shaders
 
 	compile_shader(cone.vert)
 	compile_shader(cone.frag)
