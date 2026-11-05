@@ -2,10 +2,10 @@
 
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec3 normal;
-layout(location = 2) in vec3 vertexColor;
+layout(location = 2) in vec2 texCoord;
 
 layout(location = 0) out vec3 outNormal;
-layout(location = 1) out vec3 outVertexColor;
+layout(location = 1) out vec2 outTexCoord;
 layout(location = 2) out vec3 outWorldPosition;
 
 layout(set = 0, binding = 0, std140) uniform Scene {
@@ -19,7 +19,6 @@ layout(set = 0, binding = 0, std140) uniform Scene {
 
 layout(set = 1, binding = 0, std140) uniform Model {
     mat4 model;
-    vec4 albedo;
     vec4 specularShininess;
 } transform;
 
@@ -29,7 +28,7 @@ void main() {
     outWorldPosition = worldPosition.xyz;
     // обратная транспонированная матрица учитывает масштаб по разным осям
     outNormal = normalize(transpose(inverse(mat3(transform.model))) * normal);
-    outVertexColor = vertexColor;
+    outTexCoord = texCoord;
 
     gl_Position = scene.viewProjection * worldPosition;
 }

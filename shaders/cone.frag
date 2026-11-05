@@ -1,7 +1,7 @@
 #version 450
 
 layout(location = 0) in vec3 normal;
-layout(location = 1) in vec3 vertexColor;
+layout(location = 1) in vec2 texCoord;
 layout(location = 2) in vec3 worldPosition;
 
 layout(location = 0) out vec4 outColor;
@@ -17,9 +17,30 @@ layout(set = 0, binding = 0, std140) uniform Scene {
 
 layout(set = 1, binding = 0, std140) uniform Model {
     mat4 model;
-    vec4 albedo;
     vec4 specularShininess;
 } transform;
+
+layout(set = 1, binding = 1) uniform sampler2D albedoTexture;
+
+layout(push_constant) uniform Sampling {
+    float time;
+    uint enabled;
+} sampling;
+
+vec3 sampleAlbedo() {
+    if (sampling.enabled == 0u)
+        return texture(albedoTexture, texCoord).rgb;
+
+    // Два чтения одного изображения с разными движущимися UV.
+    float t = sampling.time;
+    vec2 uv1 = texCoord * 2.0 + vec2(0.08 * t, 0.04 * sin(t));
+    vec2 uv2 = texCoord.yx * vec2(3.0, -2.0) + vec2(-0.05 * t, 0.06 * t);
+    vec3 first = texture(albedoTexture, uv1).rgb;
+    vec3 second = texture(albedoTexture, uv2).rgb;
+    float weight = 0.5 + 0.25 * sin(t);
+    vec3 modulation = 0.7 + 0.3 * cos(vec3(0.0, 2.1, 4.2) + t);
+    return mix(first, second, weight) * modulation;
+}
 
 struct PointLight {
     vec4 positionIntensity;
@@ -58,7 +79,7 @@ vec3 blinnPhong(vec3 N, vec3 L, vec3 V, vec3 albedo) {
 void main() {
     vec3 N = safeNormalize(normal);
     vec3 V = safeNormalize(scene.cameraPositionFov.xyz - worldPosition);
-    vec3 albedo = transform.albedo.rgb * vertexColor;
+    vec3 albedo = sampleAlbedo();
     vec3 result = scene.ambient.rgb * scene.ambient.w * albedo;
 
     // направление к источнику противоположно направлению его лучей

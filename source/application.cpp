@@ -1,4 +1,5 @@
 #include "application.hpp"
+#include "gpu_resources.hpp"
 
 #include <imgui.h>
 
@@ -16,9 +17,9 @@ namespace application {
 
 namespace {
 
-// вершина хранит координаты, нормаль для освещения и процедурный цвет
+// координаты, нормаль и UV; альбедо загружается из текстуры
 struct Vertex {
-    float x, y, z, nx, ny, nz, r, g, b;
+    float x, y, z, nx, ny, nz, u, v;
 };
 
 struct Vec4 {
@@ -32,8 +33,12 @@ struct Matrix4 {
 // порядок полей совпадает с uniform-блоком в шейдерах
 struct Transform {
     Matrix4 model;
-    Vec4 albedo;
     Vec4 specular_shininess;
+};
+
+struct SamplingPush {
+    float time;
+    uint32_t enabled;
 };
 
 struct SceneData {
@@ -70,14 +75,26 @@ struct MarkerVertex {
     float r, g, b;
 };
 
-static_assert(sizeof(Transform) == 96);
+static_assert(sizeof(Transform) == 80);
+static_assert(sizeof(SamplingPush) == 8);
 static_assert(sizeof(SceneData) == 144);
 static_assert(sizeof(PointLight) == 32);
 static_assert(sizeof(SpotLight) == 64);
 
 std::vector<Vertex> vertices;
-VkBuffer buffer = VK_NULL_HANDLE;
-VmaAllocation allocation = VK_NULL_HANDLE;
+std::vector<uint32_t> indices;
+gpu::Buffer vertex_buffer;
+gpu::Buffer index_buffer;
+constexpr uint32_t model_count = 2;
+constexpr uint32_t texture_count = 3;
+gpu::Texture textures[texture_count];
+const char* texture_names[] = {"Grass", "Night stars", "Water"};
+const char* texture_paths[] = {"textures/grass.png", "textures/night-stars.png", "textures/water.png"};
+int model_textures[model_count] = {0, 1};
+bool animated_sampling = true;
+float sampling_time = 0.0f;
+VkDeviceSize model_stride = 0;
+int selected_model = 0;
 
 VkPipelineLayout layout = VK_NULL_HANDLE;
 VkPipeline pipeline = VK_NULL_HANDLE;
@@ -90,7 +107,7 @@ VkDescriptorSetLayout descriptor_layout = VK_NULL_HANDLE;
 VkDescriptorPool descriptor_pool = VK_NULL_HANDLE;
 VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
 VkDescriptorSetLayout model_descriptor_layout = VK_NULL_HANDLE;
-VkDescriptorSet model_descriptor_set = VK_NULL_HANDLE;
+VkDescriptorSet material_sets[texture_count] = {};
 
 MappedBuffer model_buffer;
 MappedBuffer point_buffer;
@@ -101,17 +118,16 @@ std::vector<SpotLight> spot_lights;
 VkPipelineLayout marker_layout = VK_NULL_HANDLE;
 VkPipeline marker_pipeline = VK_NULL_HANDLE;
 VkPipeline line_pipeline = VK_NULL_HANDLE;
-MappedBuffer marker_buffer;
-MappedBuffer line_buffer;
+gpu::Buffer marker_buffer;
+gpu::Buffer line_buffer;
 std::vector<MarkerVertex> marker_vertices;
 std::vector<MarkerVertex> line_vertices;
 bool show_light_markers = true;
 bool show_spot_cones = true;
 
-float object_position[3] = {0.0f, 0.0f, 0.0f};
-float object_rotation_deg[3] = {-17.0f, 29.0f, 0.0f};
-float object_scale[3] = {1.0f, 1.0f, 1.0f};
-float selected_color[3] = {1.0f, 0.65f, 0.35f};
+float object_positions[model_count][3] = {{0.0f, 0.0f, 0.0f}, {1.65f, 0.0f, 0.0f}};
+float object_rotations[model_count][3] = {{-17.0f, 29.0f, 0.0f}, {-17.0f, 29.0f, 0.0f}};
+float object_scales[model_count][3] = {{0.7f, 0.7f, 0.7f}, {0.7f, 0.7f, 0.7f}};
 
 float camera_position[3] = {0.0f, 0.0f, 4.5f};
 float camera_rotation_deg[3] = {0.0f, 0.0f, 0.0f};
@@ -258,13 +274,13 @@ void addMarkerCube(const Vec4& position, const Vec4& color) {
         {-1, -1, -1}, {1, -1, -1}, {1, 1, -1}, {-1, 1, -1},
         {-1, -1, 1}, {1, -1, 1}, {1, 1, 1}, {-1, 1, 1},
     };
-    constexpr int indices[] = {
+    constexpr int cube_indices[] = {
         0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 7, 6,
         0, 4, 5, 0, 5, 1, 3, 2, 6, 3, 6, 7,
         0, 3, 7, 0, 7, 4, 1, 5, 6, 1, 6, 2,
     };
 
-    for (int index : indices) {
+    for (int index : cube_indices) {
         const auto& corner = corners[index];
         marker_vertices.push_back({
             position.x + corner[0] * half_size,
@@ -329,19 +345,12 @@ void addSpotCone(const SpotLight& light) {
     }
 }
 
-void uploadMarkerVertices(MappedBuffer& target, const std::vector<MarkerVertex>& data) {
+void uploadMarkerVertices(gpu::Buffer& target, const std::vector<MarkerVertex>& data) {
+    gpu::destroy(target);
     if (data.empty())
         return;
-
-    const VkDeviceSize bytes = data.size() * sizeof(MarkerVertex);
-    if (bytes > target.size) {
-        destroyMappedBuffer(target);
-        createMappedBuffer(target, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
-    }
-
-    std::memcpy(target.data, data.data(), size_t(bytes));
-    check(vmaFlushAllocation(graphics::internal::context.allocator, target.allocation, 0, bytes),
-          "Cannot flush marker vertices");
+    target = gpu::uploadBuffer(data.data(), data.size() * sizeof(MarkerVertex),
+                               VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
 }
 
 void updateLightMarkers() {
@@ -367,16 +376,9 @@ void buildCone() {
     constexpr uint32_t segments = 48;
     constexpr float radius = 1.0f, height = 2.0f;
 
-    vertices.reserve(segments * 6);
-
-    // цвет вершины вычисляется из её локальных координат до преобразований
-    const auto addVertex = [&](float x, float y, float z, float nx, float ny, float nz) {
-        const float r = 0.4f + 0.6f * (x / radius + 1.0f) * 0.5f;
-        const float g = 0.4f + 0.6f * (y / height + 0.5f);
-        const float b = 0.4f + 0.6f * (z / radius + 1.0f) * 0.5f;
-
-        vertices.push_back({x, y, z, nx, ny, nz, r, g, b});
-    };
+    // Боковая развёртка имеет отдельные вершины на шве U=0 / U=1.
+    vertices.reserve(segments * 4 + 1);
+    indices.reserve(segments * 6);
 
     for (uint32_t i = 0; i < segments; ++i) {
         const float a = 2.0f * std::numbers::pi_v<float> * float(i) / segments;
@@ -393,13 +395,23 @@ void buildCone() {
         const float ny = radius / height * normal_scale;
         const float nz = std::sin(m) * normal_scale;
 
-        addVertex(0, height / 2, 0, nx, ny, nz);
-        addVertex(x1, -height / 2, z1, nx, ny, nz);
-        addVertex(x0, -height / 2, z0, nx, ny, nz);
+        const uint32_t first = uint32_t(vertices.size());
+        const float u0 = float(i) / segments, u1 = float(i + 1) / segments;
+        vertices.push_back({0, height / 2, 0, nx, ny, nz, (u0 + u1) / 2, 0});
+        vertices.push_back({x1, -height / 2, z1, nx, ny, nz, u1, 1});
+        vertices.push_back({x0, -height / 2, z0, nx, ny, nz, u0, 1});
+        indices.insert(indices.end(), {first, first + 1, first + 2});
+    }
 
-        addVertex(0, -height / 2, 0, 0, -1, 0);
-        addVertex(x0, -height / 2, z0, 0, -1, 0);
-        addVertex(x1, -height / 2, z1, 0, -1, 0);
+    // Планарная развёртка основания; центр и обод переиспользуются индексами.
+    const uint32_t center = uint32_t(vertices.size());
+    vertices.push_back({0, -height / 2, 0, 0, -1, 0, 0.5f, 0.5f});
+    for (uint32_t i = 0; i < segments; ++i) {
+        const float angle = 2.0f * std::numbers::pi_v<float> * float(i) / segments;
+        const float x = std::cos(angle), z = std::sin(angle);
+        vertices.push_back({radius * x, -height / 2, radius * z, 0, -1, 0,
+                            0.5f + x * 0.5f, 0.5f + z * 0.5f});
+        indices.insert(indices.end(), {center, center + 1 + i, center + 1 + (i + 1) % segments});
     }
 }
 
@@ -450,7 +462,7 @@ void makePipeline() {
     const VkVertexInputAttributeDescription attributes[] = {
         {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, x)},
         {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, nx)},
-        {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, r)},
+        {2, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(Vertex, u)},
     };
 
     const VkPipelineVertexInputStateCreateInfo input = {
@@ -511,10 +523,13 @@ void makePipeline() {
     };
 
     const VkDescriptorSetLayout set_layouts[] = {descriptor_layout, model_descriptor_layout};
+    const VkPushConstantRange sampling_range = {VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(SamplingPush)};
     const VkPipelineLayoutCreateInfo layout_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 2,
         .pSetLayouts = set_layouts,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &sampling_range,
     };
     check(vkCreatePipelineLayout(c.device, &layout_info, nullptr, &layout),
           "Cannot create pipeline layout");
@@ -604,30 +619,19 @@ void makePipeline() {
 bool initialize() {
     const auto& c = graphics::internal::context;
 
+    gpu::initialize();
     buildCone();
+    vertex_buffer = gpu::uploadBuffer(vertices.data(), vertices.size() * sizeof(Vertex),
+                                      VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+    index_buffer = gpu::uploadBuffer(indices.data(), indices.size() * sizeof(uint32_t),
+                                     VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    for (uint32_t i = 0; i < texture_count; ++i)
+        textures[i] = gpu::loadTexture(texture_paths[i]);
 
-    const VkDeviceSize bytes = vertices.size() * sizeof(Vertex);
-
-    // буфер вершин создаётся один раз, так как геометрия конуса не меняется
-    const VkBufferCreateInfo info = {
-        .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-        .size = bytes,
-        .usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-    };
     const VmaAllocationCreateInfo alloc_info = {
         .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
     };
-    check(vmaCreateBuffer(c.allocator, &info, &alloc_info, &buffer, &allocation, nullptr),
-          "Cannot allocate cone vertices");
-
-    void* data = nullptr;
-    check(vmaMapMemory(c.allocator, allocation, &data), "Cannot map vertex buffer");
-    std::memcpy(data, vertices.data(), size_t(bytes));
-    vmaFlushAllocation(c.allocator, allocation, 0, bytes);
-    vmaUnmapMemory(c.allocator, allocation);
-
     // параметры сцены обновляются в этом буфере перед отрисовкой
     const VkBufferCreateInfo uniform_info = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -641,7 +645,11 @@ bool initialize() {
     check(vmaMapMemory(c.allocator, uniform_allocation, &uniform_data),
           "Cannot map scene uniform buffer");
 
-    createMappedBuffer(model_buffer, sizeof(Transform), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(c.physical_device, &properties);
+    const VkDeviceSize alignment = properties.limits.minUniformBufferOffsetAlignment;
+    model_stride = (sizeof(Transform) + alignment - 1) / alignment * alignment;
+    createMappedBuffer(model_buffer, model_stride * model_count, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
 
     // set 0 содержит общие данные сцены и два массива источников света
     const VkDescriptorSetLayoutBinding bindings[] = {
@@ -658,49 +666,68 @@ bool initialize() {
     check(vkCreateDescriptorSetLayout(c.device, &descriptor_info, nullptr, &descriptor_layout),
           "Cannot create scene descriptor layout");
 
-    // set 1 содержит только матрицу модели и её материал
-    const VkDescriptorSetLayoutBinding model_binding = {
-        0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
-        VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr
+    // Каждый материал связывает общий массив моделей и свою текстуру.
+    const VkDescriptorSetLayoutBinding model_bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
+         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
     };
     const VkDescriptorSetLayoutCreateInfo model_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 1,
-        .pBindings = &model_binding,
+        .bindingCount = 2,
+        .pBindings = model_bindings,
     };
     check(vkCreateDescriptorSetLayout(c.device, &model_info, nullptr, &model_descriptor_layout),
           "Cannot create model descriptor layout");
 
     const VkDescriptorPoolSize pool_sizes[] = {
-        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 2},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, texture_count},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_count},
     };
     const VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-        .maxSets = 2,
-        .poolSizeCount = 2,
+        .maxSets = 1 + texture_count,
+        .poolSizeCount = 4,
         .pPoolSizes = pool_sizes,
     };
     check(vkCreateDescriptorPool(c.device, &pool_info, nullptr, &descriptor_pool),
           "Cannot create descriptor pool");
 
-    const VkDescriptorSetLayout set_layouts[] = {descriptor_layout, model_descriptor_layout};
+    VkDescriptorSetLayout set_layouts[1 + texture_count];
+    set_layouts[0] = descriptor_layout;
+    std::fill_n(set_layouts + 1, texture_count, model_descriptor_layout);
     const VkDescriptorSetAllocateInfo set_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
         .descriptorPool = descriptor_pool,
-        .descriptorSetCount = 2,
+        .descriptorSetCount = 1 + texture_count,
         .pSetLayouts = set_layouts,
     };
-    VkDescriptorSet sets[2];
+    VkDescriptorSet sets[1 + texture_count];
     check(vkAllocateDescriptorSets(c.device, &set_info, sets),
           "Cannot allocate descriptor sets");
     descriptor_set = sets[0];
-    model_descriptor_set = sets[1];
 
     writeBufferDescriptor(descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                           uniform_buffer, sizeof(SceneData));
-    writeBufferDescriptor(model_descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
-                          model_buffer.buffer, sizeof(Transform));
+    for (uint32_t i = 0; i < texture_count; ++i) {
+        material_sets[i] = sets[i + 1];
+        writeBufferDescriptor(material_sets[i], 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
+                              model_buffer.buffer, sizeof(Transform));
+        const VkDescriptorImageInfo image = {
+            textures[i].sampler, textures[i].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+        };
+        const VkWriteDescriptorSet write = {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .dstSet = material_sets[i],
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &image,
+        };
+        vkUpdateDescriptorSets(c.device, 1, &write, 0, nullptr);
+    }
     uploadLights(point_buffer, point_lights, 1);
     uploadLights(spot_buffer, spot_lights, 2);
 
@@ -727,15 +754,23 @@ void shutdown() {
     destroyMappedBuffer(point_buffer);
     destroyMappedBuffer(spot_buffer);
     destroyMappedBuffer(model_buffer);
-    destroyMappedBuffer(marker_buffer);
-    destroyMappedBuffer(line_buffer);
+    gpu::destroy(marker_buffer);
+    gpu::destroy(line_buffer);
+    for (gpu::Texture& texture : textures)
+        gpu::destroy(texture);
 
     vmaUnmapMemory(c.allocator, uniform_allocation);
     vmaDestroyBuffer(c.allocator, uniform_buffer, uniform_allocation);
-    vmaDestroyBuffer(c.allocator, buffer, allocation);
+    gpu::destroy(vertex_buffer);
+    gpu::destroy(index_buffer);
+    gpu::shutdown();
 }
 
-void update(double) {
+void update(double time) {
+    sampling_time = float(time);
+    float* object_position = object_positions[selected_model];
+    float* object_rotation_deg = object_rotations[selected_model];
+    float* object_scale = object_scales[selected_model];
     // вращаем объект только при перетаскивании вне интерфейса
     const ImGuiIO& io = ImGui::GetIO();
     if (!io.WantCaptureMouse && ImGui::IsMouseDragging(ImGuiMouseButton_Left)) {
@@ -745,7 +780,17 @@ void update(double) {
 
     ImGui::SetNextWindowPos(ImVec2(15, 15), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(440, 650), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Cone - lab 2");
+    ImGui::Begin("Texturing - lab 3");
+
+    if (ImGui::CollapsingHeader("Textures", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::Combo("Selected model", &selected_model, "Cone 1\0Cone 2\0");
+        // Указатели обновляются сразу после выбора, чтобы редактировать нужную модель.
+        object_position = object_positions[selected_model];
+        object_rotation_deg = object_rotations[selected_model];
+        object_scale = object_scales[selected_model];
+        ImGui::Combo("Albedo texture", &model_textures[selected_model], texture_names, texture_count);
+        ImGui::Checkbox("Animated sampling (cone 1)", &animated_sampling);
+    }
 
     if (ImGui::CollapsingHeader("Camera", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::DragFloat3("Camera position", camera_position, 0.02f);
@@ -847,7 +892,6 @@ void update(double) {
     }
 
     if (ImGui::CollapsingHeader("Material", ImGuiTreeNodeFlags_DefaultOpen)) {
-        ImGui::ColorEdit3("Albedo", selected_color);
         ImGui::ColorEdit3("Specular color", specular_color);
         ImGui::SliderFloat("Shininess", &shininess, 1.0f, 256.0f);
 
@@ -866,8 +910,8 @@ void update(double) {
         ImGui::DragFloat3("Rotation (degrees)", object_rotation_deg, 0.5f);
         ImGui::DragFloat3("Scale", object_scale, 0.01f, 0.1f, 3.0f);
 
-        for (float& scale : object_scale)
-            if (scale < 0.1f) scale = 0.1f;
+        for (int axis = 0; axis < 3; ++axis)
+            object_scale[axis] = std::max(object_scale[axis], 0.1f);
     }
 
     ImGui::TextUnformatted("Camera rotation: X / Y / Z, degrees");
@@ -903,7 +947,8 @@ void render(const graphics::internal::FrameData& fd) {
     // подключаем конвейер и геометрию конуса
     vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     const VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &buffer, &offset);
+    vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vertex_buffer.buffer, &offset);
+    vkCmdBindIndexBuffer(fd.command_buffer, index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
 
     const VkViewport viewport = {0, 0, float(c.swapchain_extent.width),
                                  float(c.swapchain_extent.height), 0, 1};
@@ -911,19 +956,21 @@ void render(const graphics::internal::FrameData& fd) {
     vkCmdSetViewport(fd.command_buffer, 0, 1, &viewport);
     vkCmdSetScissor(fd.command_buffer, 0, 1, &scissor);
 
-    Matrix4 model = rotationMatrix(object_rotation_deg);
-    for (int column = 0; column < 3; ++column)
-        for (int row = 0; row < 3; ++row)
-            model.values[column * 4 + row] *= object_scale[column];
-    model.values[12] = object_position[0];
-    model.values[13] = object_position[1];
-    model.values[14] = object_position[2];
-
-    const Transform transform = {
-        model,
-        {selected_color[0], selected_color[1], selected_color[2], 0.0f},
-        {specular_color[0], specular_color[1], specular_color[2], shininess},
-    };
+    for (uint32_t i = 0; i < model_count; ++i) {
+        Matrix4 model = rotationMatrix(object_rotations[i]);
+        for (int column = 0; column < 3; ++column)
+            for (int row = 0; row < 3; ++row)
+                model.values[column * 4 + row] *= object_scales[i][column];
+        model.values[12] = object_positions[i][0];
+        model.values[13] = object_positions[i][1];
+        model.values[14] = object_positions[i][2];
+        const Transform transform = {
+            model,
+            {specular_color[0], specular_color[1], specular_color[2], shininess},
+        };
+        std::memcpy(static_cast<char*>(model_buffer.data) + model_stride * i,
+                     &transform, sizeof(transform));
+    }
     const SceneData scene = {
         makeViewProjection(float(c.swapchain_extent.width) / float(c.swapchain_extent.height)),
         {camera_position[0], camera_position[1], camera_position[2], 0.0f},
@@ -937,17 +984,21 @@ void render(const graphics::internal::FrameData& fd) {
     uploadLights(point_buffer, point_lights, 1);
     uploadLights(spot_buffer, spot_lights, 2);
     std::memcpy(uniform_data, &scene, sizeof(scene));
-    std::memcpy(model_buffer.data, &transform, sizeof(transform));
     check(vmaFlushAllocation(c.allocator, uniform_allocation, 0, sizeof(scene)),
           "Cannot flush scene uniform buffer");
-    check(vmaFlushAllocation(c.allocator, model_buffer.allocation, 0, sizeof(transform)),
+    check(vmaFlushAllocation(c.allocator, model_buffer.allocation, 0, model_buffer.size),
           "Cannot flush model uniform buffer");
 
-    const VkDescriptorSet sets[] = {descriptor_set, model_descriptor_set};
-    vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            layout, 0, 2, sets, 0, nullptr);
-
-    vkCmdDraw(fd.command_buffer, uint32_t(vertices.size()), 1, 0, 0);
+    for (uint32_t i = 0; i < model_count; ++i) {
+        const uint32_t dynamic_offset = uint32_t(model_stride * i);
+        const VkDescriptorSet sets[] = {descriptor_set, material_sets[model_textures[i]]};
+        vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                layout, 0, 2, sets, 1, &dynamic_offset);
+        const SamplingPush sampling = {sampling_time, uint32_t(i == 0 && animated_sampling)};
+        vkCmdPushConstants(fd.command_buffer, layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                            0, sizeof(sampling), &sampling);
+        vkCmdDrawIndexed(fd.command_buffer, uint32_t(indices.size()), 1, 0, 0, 0);
+    }
 
     if (!marker_vertices.empty()) {
         vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, marker_pipeline);
