@@ -19,7 +19,7 @@ struct Texture {
 void initialize();
 void shutdown();
 Buffer uploadBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usage);
-Texture loadTexture(const char* path);
+Texture loadTexture(const char* path, VkFormat format = VK_FORMAT_R8G8B8A8_SRGB);
 void destroy(Buffer& buffer);
 void destroy(Texture& texture);
 

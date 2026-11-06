@@ -124,7 +124,7 @@ Buffer uploadBuffer(const void* data, VkDeviceSize size, VkBufferUsageFlags usag
     return result;
 }
 
-Texture loadTexture(const char* path) {
+Texture loadTexture(const char* path, VkFormat format) {
     int width, height, channels;
     stbi_uc* pixels = stbi_load(path, &width, &height, &channels, STBI_rgb_alpha);
     if (!pixels)
@@ -136,7 +136,7 @@ Texture loadTexture(const char* path) {
     const VkImageCreateInfo info = {
         .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
         .imageType = VK_IMAGE_TYPE_2D,
-        .format = VK_FORMAT_R8G8B8A8_SRGB,
+        .format = format,
         .extent = {uint32_t(width), uint32_t(height), 1},
         .mipLevels = 1,
         .arrayLayers = 1,

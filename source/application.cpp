@@ -88,8 +88,14 @@ gpu::Buffer index_buffer;
 constexpr uint32_t model_count = 2;
 constexpr uint32_t texture_count = 3;
 gpu::Texture textures[texture_count];
+gpu::Texture specular_textures[texture_count];
+gpu::Texture emissive_textures[texture_count];
+gpu::Texture black_texture;
 const char* texture_names[] = {"Grass", "Night stars", "Water"};
 const char* texture_paths[] = {"textures/grass.png", "textures/night-stars.png", "textures/water.png"};
+// Отсутствующая карта использует общий чёрный пиксель.
+const char* specular_paths[] = {nullptr, nullptr, "textures/water_specular.png"};
+const char* emissive_paths[] = {nullptr, "textures/night-stars_emissive.png", nullptr};
 int model_textures[model_count] = {0, 1};
 bool animated_sampling = true;
 float sampling_time = 0.0f;
@@ -243,6 +249,21 @@ void writeBufferDescriptor(VkDescriptorSet set, uint32_t binding,
         .descriptorCount = 1,
         .descriptorType = type,
         .pBufferInfo = &buffer_info,
+    };
+    vkUpdateDescriptorSets(graphics::internal::context.device, 1, &write, 0, nullptr);
+}
+
+void writeTextureDescriptor(VkDescriptorSet set, uint32_t binding, const gpu::Texture& texture) {
+    const VkDescriptorImageInfo image = {
+        texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    };
+    const VkWriteDescriptorSet write = {
+        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+        .dstSet = set,
+        .dstBinding = binding,
+        .descriptorCount = 1,
+        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        .pImageInfo = &image,
     };
     vkUpdateDescriptorSets(graphics::internal::context.device, 1, &write, 0, nullptr);
 }
@@ -625,8 +646,14 @@ bool initialize() {
                                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     index_buffer = gpu::uploadBuffer(indices.data(), indices.size() * sizeof(uint32_t),
                                      VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
-    for (uint32_t i = 0; i < texture_count; ++i)
+    black_texture = gpu::loadTexture("textures/black.png", VK_FORMAT_R8G8B8A8_UNORM);
+    for (uint32_t i = 0; i < texture_count; ++i) {
         textures[i] = gpu::loadTexture(texture_paths[i]);
+        if (specular_paths[i])
+            specular_textures[i] = gpu::loadTexture(specular_paths[i], VK_FORMAT_R8G8B8A8_UNORM);
+        if (emissive_paths[i])
+            emissive_textures[i] = gpu::loadTexture(emissive_paths[i]);
+    }
 
     const VmaAllocationCreateInfo alloc_info = {
         .flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT,
@@ -671,10 +698,12 @@ bool initialize() {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1,
          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         {1, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
     };
     const VkDescriptorSetLayoutCreateInfo model_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 2,
+        .bindingCount = 4,
         .pBindings = model_bindings,
     };
     check(vkCreateDescriptorSetLayout(c.device, &model_info, nullptr, &model_descriptor_layout),
@@ -684,7 +713,7 @@ bool initialize() {
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, texture_count},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_count},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_count * 3},
     };
     const VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -715,18 +744,11 @@ bool initialize() {
         material_sets[i] = sets[i + 1];
         writeBufferDescriptor(material_sets[i], 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
                               model_buffer.buffer, sizeof(Transform));
-        const VkDescriptorImageInfo image = {
-            textures[i].sampler, textures[i].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-        };
-        const VkWriteDescriptorSet write = {
-            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = material_sets[i],
-            .dstBinding = 1,
-            .descriptorCount = 1,
-            .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            .pImageInfo = &image,
-        };
-        vkUpdateDescriptorSets(c.device, 1, &write, 0, nullptr);
+        writeTextureDescriptor(material_sets[i], 1, textures[i]);
+        writeTextureDescriptor(material_sets[i], 2,
+                               specular_paths[i] ? specular_textures[i] : black_texture);
+        writeTextureDescriptor(material_sets[i], 3,
+                               emissive_paths[i] ? emissive_textures[i] : black_texture);
     }
     uploadLights(point_buffer, point_lights, 1);
     uploadLights(spot_buffer, spot_lights, 2);
@@ -758,6 +780,11 @@ void shutdown() {
     gpu::destroy(line_buffer);
     for (gpu::Texture& texture : textures)
         gpu::destroy(texture);
+    for (gpu::Texture& texture : specular_textures)
+        gpu::destroy(texture);
+    for (gpu::Texture& texture : emissive_textures)
+        gpu::destroy(texture);
+    gpu::destroy(black_texture);
 
     vmaUnmapMemory(c.allocator, uniform_allocation);
     vmaDestroyBuffer(c.allocator, uniform_buffer, uniform_allocation);

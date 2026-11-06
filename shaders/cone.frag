@@ -21,25 +21,26 @@ layout(set = 1, binding = 0, std140) uniform Model {
 } transform;
 
 layout(set = 1, binding = 1) uniform sampler2D albedoTexture;
+layout(set = 1, binding = 2) uniform sampler2D specularTexture;
+layout(set = 1, binding = 3) uniform sampler2D emissiveTexture;
 
 layout(push_constant) uniform Sampling {
     float time;
     uint enabled;
 } sampling;
 
-vec3 sampleAlbedo() {
+vec3 sampleMaterialTexture(sampler2D materialTexture) {
     if (sampling.enabled == 0u)
-        return texture(albedoTexture, texCoord).rgb;
+        return texture(materialTexture, texCoord).rgb;
 
     // Два чтения одного изображения с разными движущимися UV.
     float t = sampling.time;
     vec2 uv1 = texCoord * 2.0 + vec2(0.08 * t, 0.04 * sin(t));
     vec2 uv2 = texCoord.yx * vec2(3.0, -2.0) + vec2(-0.05 * t, 0.06 * t);
-    vec3 first = texture(albedoTexture, uv1).rgb;
-    vec3 second = texture(albedoTexture, uv2).rgb;
+    vec3 first = texture(materialTexture, uv1).rgb;
+    vec3 second = texture(materialTexture, uv2).rgb;
     float weight = 0.5 + 0.25 * sin(t);
-    vec3 modulation = 0.7 + 0.3 * cos(vec3(0.0, 2.1, 4.2) + t);
-    return mix(first, second, weight) * modulation;
+    return mix(first, second, weight);
 }
 
 struct PointLight {
@@ -66,25 +67,28 @@ vec3 safeNormalize(vec3 value) {
     return value / max(length(value), 0.00001);
 }
 
-vec3 blinnPhong(vec3 N, vec3 L, vec3 V, vec3 albedo) {
+vec3 blinnPhong(vec3 N, vec3 L, vec3 V, vec3 albedo, vec3 specularMask) {
     vec3 H = safeNormalize(L + V);
     float diffuse = max(dot(N, L), 0.0);
     float specular = 0.0;
     if (diffuse > 0.0)
         specular = pow(max(dot(N, H), 0.0), transform.specularShininess.w);
 
-    return albedo * diffuse + transform.specularShininess.rgb * specular;
+    return albedo * diffuse + transform.specularShininess.rgb * specularMask * specular;
 }
 
 void main() {
     vec3 N = safeNormalize(normal);
     vec3 V = safeNormalize(scene.cameraPositionFov.xyz - worldPosition);
-    vec3 albedo = sampleAlbedo();
+    vec3 albedo = sampleMaterialTexture(albedoTexture);
+    if (sampling.enabled != 0u)
+        albedo *= 0.7 + 0.3 * cos(vec3(0.0, 2.1, 4.2) + sampling.time);
+    vec3 specularMask = sampleMaterialTexture(specularTexture);
     vec3 result = scene.ambient.rgb * scene.ambient.w * albedo;
 
     // направление к источнику противоположно направлению его лучей
     vec3 L = safeNormalize(-scene.lightDirectionIntensity.xyz);
-    result += scene.lightColor.rgb * scene.lightDirectionIntensity.w * blinnPhong(N, L, V, albedo);
+    result += scene.lightColor.rgb * scene.lightDirectionIntensity.w * blinnPhong(N, L, V, albedo, specularMask);
 
     for (uint i = 0; i < scene.lightCounts.x; ++i) {
         PointLight light = pointLights[i];
@@ -94,7 +98,7 @@ void main() {
 
         // яркость точечного источника убывает как 1 / r^2
         result += light.color.rgb * light.positionIntensity.w / distanceSquared *
-                  blinnPhong(N, L, V, albedo);
+                  blinnPhong(N, L, V, albedo, specularMask);
     }
 
     for (uint i = 0; i < scene.lightCounts.y; ++i) {
@@ -110,8 +114,10 @@ void main() {
         // между двумя углами свет плавно затухает; равные углы дают резкий край
         float cone = inner > outer ? smoothstep(outer, inner, theta) : step(inner, theta);
         result += light.color.rgb * light.positionIntensity.w * cone / distanceSquared *
-                  blinnPhong(N, L, V, albedo);
+                  blinnPhong(N, L, V, albedo, specularMask);
     }
 
+    // Emissive добавляется после всего освещения и остаётся видимой без источников.
+    result += sampleMaterialTexture(emissiveTexture);
     outColor = vec4(result, 1.0);
 }
