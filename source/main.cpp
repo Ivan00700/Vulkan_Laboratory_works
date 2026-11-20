@@ -17,7 +17,7 @@ namespace {
 constexpr int32_t default_window_width = 1280;
 constexpr int32_t default_window_height = 720;
 
-constexpr char default_window_title[] = "Lab 3 - Texturing";
+constexpr char default_window_title[] = "Lab 4 - Shadow Mapping";
 
 GLFWwindow* glfw_window;
 

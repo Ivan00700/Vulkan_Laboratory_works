@@ -12,6 +12,7 @@ layout(set = 0, binding = 0, std140) uniform Scene {
     vec4 lightColor;
     vec4 ambient;
     uvec4 lightCounts;
+    mat4 lightViewProjection;
 } scene;
 
 void main() {

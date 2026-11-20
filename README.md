@@ -2,16 +2,24 @@
 
 Работы выполнены на Vulkan, GLFW и ImGui. Каждая лабораторная сохранена в отдельной ветке, а `main` содержит последнюю выполненную работу.
 
-Актуальная реализация: **ЛР №3 «Текстурирование», вариант 9 — конус**. Выполнены базовое задание и все дополнительные задания №1–3 для оценки 5.
+Актуальная реализация — **ЛР №4 «Наложение теней», вариант 9 — конус**. Два конуса отбрасывают тени от направленного света на текстурированный пол.
 
 ## Ветки
 
 | Ветка | Содержимое |
 | --- | --- |
-| [main](https://github.com/Ivan00700/Vulkan_Laboratory_works/tree/main) | Актуальная полная версия — ЛР №3 |
+| [main](https://github.com/Ivan00700/Vulkan_Laboratory_works/tree/main) | Актуальная версия — ЛР №4 |
 | [LR_1](https://github.com/Ivan00700/Vulkan_Laboratory_works/tree/LR_1) | ЛР №1: конус, преобразования и проекции |
 | [LR_2](https://github.com/Ivan00700/Vulkan_Laboratory_works/tree/LR_2) | ЛР №2: камера, освещение и визуализация источников |
 | [LR_3](https://github.com/Ivan00700/Vulkan_Laboratory_works/tree/LR_3) | ЛР №3: текстуры, динамический uniform-буфер и анимированное сэмплирование |
+| [LR_4](https://github.com/Ivan00700/Vulkan_Laboratory_works/tree/LR_4) | ЛР №4: карта теней направленного света и текстурированный пол |
+
+## Что реализовано в ЛР №4
+
+- Карта глубины 2048 × 2048 строится каждый кадр через Vulkan 1.3 Dynamic Rendering.
+- Проход света использует матрицу вида LookAt, ортографическую проекцию и конвейер с одним вершинным шейдером.
+- Основной фрагментный шейдер использует `sampler2DShadow` с аппаратным сравнением глубины `LESS`.
+- В разделе **Shadows** регулятор **Ortho size** изменяет размер области проекции света, а **Depth bias** задаёт постоянный коэффициент смещения глубины.
 
 ## Что реализовано в ЛР №3
 
@@ -28,10 +36,10 @@
 
 ## Сборка и запуск в Windows
 
-Нужны Visual Studio 2022 с компонентами C++, CMake, Git и Vulkan SDK с `glslc`. При первой сборке необходим Интернет для загрузки зависимостей; их версии закреплены в CMake.
+Для сборки нужны Visual Studio 2022 с компонентами C++, CMake, Git и Vulkan SDK с `glslc`. При первой сборке нужен Интернет для загрузки зависимостей. Для запуска ЛР №4 требуется устройство с поддержкой Vulkan 1.3 и Dynamic Rendering.
 
 ```powershell
-git clone --branch LR_3 https://github.com/Ivan00700/Vulkan_Laboratory_works.git
+git clone --branch LR_4 https://github.com/Ivan00700/Vulkan_Laboratory_works.git
 cd Vulkan_Laboratory_works
 .\build.cmd
 .\run.cmd
@@ -53,7 +61,7 @@ cd Vulkan_Laboratory_works
 
 Перетаскивание левой кнопкой мыши вне панели вращает выбранный конус. Раздел **Object** задаёт его положение, поворот и масштаб. **Camera** управляет общей камерой; остальные разделы — освещением и его визуализацией.
 
-## Карты материалов на оценку 5
+## Карты материалов из ЛР №3
 
 | Материал | Albedo | Specular | Emissive |
 | --- | --- | --- | --- |
@@ -88,6 +96,7 @@ python tools/generate_material_maps.py
 | `source/application.cpp` | Геометрия с UV, интерфейс, общий буфер моделей, дескрипторы и команды отрисовки |
 | `source/gpu_resources.cpp`, `source/gpu_resources.hpp` | Загрузка PNG, staging, GPU-буферы, изображения, image view и sampler |
 | `source/graphics_internal.cpp` | Vulkan-контекст, swapchain, глубина и синхронизация кадров |
+| `shaders/shadow.vert` | Проекция геометрии со стороны света для карты глубины |
 | `shaders/cone.vert`, `shaders/cone.frag` | Передача UV, текстурное альбедо, анимированное сэмплирование и освещение |
 | `tools/generate_material_maps.py` | Подготовка specular, emissive с шумом Перлина и чёрной карты 1×1 |
 | `CMakeLists.txt` | Зависимости, сборка приложения и компиляция шейдеров |

@@ -117,6 +117,7 @@ if(GLSLC_FOUND)
 
 	compile_shader(cone.vert)
 	compile_shader(cone.frag)
+	compile_shader(shadow.vert)
 	compile_shader(marker.vert)
 	compile_shader(marker.frag)
 

@@ -49,6 +49,7 @@ struct SceneData {
     Vec4 light_color;
     Vec4 ambient;
     uint32_t light_counts[4];
+    Matrix4 light_view_projection;
 };
 
 struct PointLight {
@@ -77,7 +78,7 @@ struct MarkerVertex {
 
 static_assert(sizeof(Transform) == 80);
 static_assert(sizeof(SamplingPush) == 8);
-static_assert(sizeof(SceneData) == 144);
+static_assert(sizeof(SceneData) == 208);
 static_assert(sizeof(PointLight) == 32);
 static_assert(sizeof(SpotLight) == 64);
 
@@ -86,7 +87,12 @@ std::vector<uint32_t> indices;
 gpu::Buffer vertex_buffer;
 gpu::Buffer index_buffer;
 constexpr uint32_t model_count = 2;
+constexpr uint32_t floor_model = model_count;
+constexpr float cone_height = 2.0f;
+constexpr float initial_cone_scale = 0.7f;
+uint32_t floor_first_index = 0;
 constexpr uint32_t texture_count = 3;
+constexpr int grass_material = 0;
 gpu::Texture textures[texture_count];
 gpu::Texture specular_textures[texture_count];
 gpu::Texture emissive_textures[texture_count];
@@ -96,7 +102,7 @@ const char* texture_paths[] = {"textures/grass.png", "textures/night-stars.png",
 // Отсутствующая карта использует общий чёрный пиксель.
 const char* specular_paths[] = {nullptr, nullptr, "textures/water_specular.png"};
 const char* emissive_paths[] = {nullptr, "textures/night-stars_emissive.png", nullptr};
-int model_textures[model_count] = {0, 1};
+int model_textures[model_count] = {grass_material, 1};
 bool animated_sampling = true;
 float sampling_time = 0.0f;
 VkDeviceSize model_stride = 0;
@@ -104,6 +110,13 @@ int selected_model = 0;
 
 VkPipelineLayout layout = VK_NULL_HANDLE;
 VkPipeline pipeline = VK_NULL_HANDLE;
+VkPipeline shadow_pipeline = VK_NULL_HANDLE;
+constexpr VkExtent2D shadow_extent = {2048, 2048};
+gpu::Texture shadow_map;
+VkFormat shadow_format = VK_FORMAT_UNDEFINED;
+VkImageLayout shadow_map_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+float shadow_area_width = 14.0f;
+float shadow_depth_bias = 2.0f;
 
 VkBuffer uniform_buffer = VK_NULL_HANDLE;
 VmaAllocation uniform_allocation = VK_NULL_HANDLE;
@@ -132,15 +145,21 @@ bool show_light_markers = true;
 bool show_spot_cones = true;
 
 float object_positions[model_count][3] = {{0.0f, 0.0f, 0.0f}, {1.65f, 0.0f, 0.0f}};
-float object_rotations[model_count][3] = {{-17.0f, 29.0f, 0.0f}, {-17.0f, 29.0f, 0.0f}};
-float object_scales[model_count][3] = {{0.7f, 0.7f, 0.7f}, {0.7f, 0.7f, 0.7f}};
+float object_rotations[model_count][3] = {};
+float object_scales[model_count][3] = {
+    {initial_cone_scale, initial_cone_scale, initial_cone_scale},
+    {initial_cone_scale, initial_cone_scale, initial_cone_scale},
+};
 
-float camera_position[3] = {0.0f, 0.0f, 4.5f};
-float camera_rotation_deg[3] = {0.0f, 0.0f, 0.0f};
+constexpr float initial_camera_height = 2.8f;
+constexpr float initial_camera_distance = 5.0f;
+constexpr float initial_camera_pitch = -26.0f;
+float camera_position[3] = {0.0f, initial_camera_height, initial_camera_distance};
+float camera_rotation_deg[3] = {initial_camera_pitch, 0.0f, 0.0f};
 float camera_fov = 50.0f;
 float near_plane = 0.1f, far_plane = 100.0f;
 
-float light_direction[3] = {-0.45f, -0.85f, -0.7f};
+float light_direction[3] = {0.75f, -1.0f, 0.4f};
 float light_color[3] = {1.0f, 1.0f, 1.0f};
 float light_intensity = 1.0f;
 
@@ -208,6 +227,42 @@ Matrix4 makeViewProjection(float aspect) {
     return multiplyMatrices(projection, view);
 }
 
+Matrix4 makeLightViewProjection() {
+    const float length = std::hypot(light_direction[0], light_direction[1], light_direction[2]);
+    const Vec4 forward = length > 0.00001f ?
+        Vec4{light_direction[0] / length, light_direction[1] / length, light_direction[2] / length, 0} :
+        Vec4{0, -1, 0, 0};
+    // LookAt: выбираем ось вверх, которая не параллельна лучам.
+    Vec4 right = std::abs(forward.y) < 0.99f ?
+        Vec4{-forward.z, 0, forward.x, 0} : Vec4{0, forward.z, -forward.y, 0};
+    const float right_length = std::hypot(right.x, right.y, right.z);
+    right = {right.x / right_length, right.y / right_length, right.z / right_length, 0};
+    const Vec4 up = {
+        right.y * forward.z - right.z * forward.y,
+        right.z * forward.x - right.x * forward.z,
+        right.x * forward.y - right.y * forward.x,
+        0,
+    };
+
+    // Камера света смотрит на начало координат из точки -forward * distance.
+    constexpr float distance = 16.0f;
+    const Matrix4 view = {{
+        right.x, up.x, -forward.x, 0,
+        right.y, up.y, -forward.y, 0,
+        right.z, up.z, -forward.z, 0,
+        0, 0, -distance, 1,
+    }};
+
+    const float scale = 2.0f / shadow_area_width;
+    const Matrix4 projection = {{
+        scale, 0, 0, 0,
+        0, -scale, 0, 0,
+        0, 0, -1.0f / (2.0f * distance), 0,
+        0, 0, 0, 1,
+    }};
+    return multiplyMatrices(projection, view);
+}
+
 void createMappedBuffer(MappedBuffer& target, VkDeviceSize size, VkBufferUsageFlags usage) {
     const auto& c = graphics::internal::context;
 
@@ -253,10 +308,9 @@ void writeBufferDescriptor(VkDescriptorSet set, uint32_t binding,
     vkUpdateDescriptorSets(graphics::internal::context.device, 1, &write, 0, nullptr);
 }
 
-void writeTextureDescriptor(VkDescriptorSet set, uint32_t binding, const gpu::Texture& texture) {
-    const VkDescriptorImageInfo image = {
-        texture.sampler, texture.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-    };
+void writeTextureDescriptor(VkDescriptorSet set, uint32_t binding, const gpu::Texture& texture,
+                            VkImageLayout image_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+    const VkDescriptorImageInfo image = {texture.sampler, texture.view, image_layout};
     const VkWriteDescriptorSet write = {
         .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
         .dstSet = set,
@@ -395,7 +449,7 @@ void updateLightMarkers() {
 // каждый из 48 секторов даёт треугольник боковой поверхности и основания
 void buildCone() {
     constexpr uint32_t segments = 48;
-    constexpr float radius = 1.0f, height = 2.0f;
+    constexpr float radius = 1.0f, height = cone_height;
 
     // Боковая развёртка имеет отдельные вершины на шве U=0 / U=1.
     vertices.reserve(segments * 4 + 1);
@@ -434,6 +488,83 @@ void buildCone() {
                             0.5f + x * 0.5f, 0.5f + z * 0.5f});
         indices.insert(indices.end(), {center, center + 1 + i, center + 1 + (i + 1) % segments});
     }
+}
+
+void buildFloor() {
+    constexpr float half_extent = 5.0f;
+    constexpr float y = -0.5f * cone_height * initial_cone_scale;
+    const uint32_t first = uint32_t(vertices.size());
+    floor_first_index = uint32_t(indices.size());
+    vertices.insert(vertices.end(), {
+        {-half_extent, y, -half_extent, 0, 1, 0, 0, 0},
+        { half_extent, y, -half_extent, 0, 1, 0, 4, 0},
+        { half_extent, y,  half_extent, 0, 1, 0, 4, 4},
+        {-half_extent, y,  half_extent, 0, 1, 0, 0, 4},
+    });
+    indices.insert(indices.end(), {first, first + 2, first + 1, first, first + 3, first + 2});
+}
+
+void createShadowMap() {
+    const auto& c = graphics::internal::context;
+    constexpr VkFormat formats[] = {VK_FORMAT_D16_UNORM, VK_FORMAT_D32_SFLOAT};
+    constexpr VkFormatFeatureFlags2 required = VK_FORMAT_FEATURE_2_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                              VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+                                              VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_DEPTH_COMPARISON_BIT;
+    for (VkFormat format : formats) {
+        VkFormatProperties3 features = {.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3};
+        VkFormatProperties2 properties = {
+            .sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+            .pNext = &features,
+        };
+        vkGetPhysicalDeviceFormatProperties2(c.physical_device, format, &properties);
+        if ((features.optimalTilingFeatures & required) == required) {
+            shadow_format = format;
+            break;
+        }
+    }
+    if (shadow_format == VK_FORMAT_UNDEFINED)
+        throw std::runtime_error("No depth format supports shadow mapping");
+
+    const VkImageCreateInfo image_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+        .imageType = VK_IMAGE_TYPE_2D,
+        .format = shadow_format,
+        .extent = {shadow_extent.width, shadow_extent.height, 1},
+        .mipLevels = 1,
+        .arrayLayers = 1,
+        .samples = VK_SAMPLE_COUNT_1_BIT,
+        .tiling = VK_IMAGE_TILING_OPTIMAL,
+        .usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+        .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+        .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+    };
+    const VmaAllocationCreateInfo allocation = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
+    check(vmaCreateImage(c.allocator, &image_info, &allocation, &shadow_map.image,
+                         &shadow_map.allocation, nullptr), "Cannot allocate shadow map");
+
+    const VkImageViewCreateInfo view_info = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+        .image = shadow_map.image,
+        .viewType = VK_IMAGE_VIEW_TYPE_2D,
+        .format = shadow_format,
+        .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+    };
+    check(vkCreateImageView(c.device, &view_info, nullptr, &shadow_map.view),
+          "Cannot create shadow map view");
+
+    const VkSamplerCreateInfo sampler_info = {
+        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        .magFilter = VK_FILTER_NEAREST,
+        .minFilter = VK_FILTER_NEAREST,
+        .mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        .compareEnable = VK_TRUE,
+        .compareOp = VK_COMPARE_OP_LESS,
+    };
+    check(vkCreateSampler(c.device, &sampler_info, nullptr, &shadow_map.sampler),
+          "Cannot create shadow map sampler");
 }
 
 VkShaderModule makeShader(const char* path) {
@@ -579,6 +710,43 @@ void makePipeline() {
     vkDestroyShaderModule(c.device, vs, nullptr);
     check(result, "Cannot create graphics pipeline");
 
+    VkShaderModule shadow_vs = makeShader("shaders/shadow.vert.spv");
+    const VkPipelineShaderStageCreateInfo shadow_stage = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+        .stage = VK_SHADER_STAGE_VERTEX_BIT,
+        .module = shadow_vs,
+        .pName = "main",
+    };
+    const VkPipelineRenderingCreateInfo rendering_info = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO,
+        .depthAttachmentFormat = shadow_format,
+    };
+    VkPipelineVertexInputStateCreateInfo shadow_input = input;
+    shadow_input.vertexAttributeDescriptionCount = 1;
+    VkPipelineRasterizationStateCreateInfo shadow_raster = raster;
+    shadow_raster.depthBiasEnable = VK_TRUE;
+    const VkDynamicState shadow_states[] = {
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS,
+    };
+    const VkPipelineDynamicStateCreateInfo shadow_dynamic = {
+        .sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+        .dynamicStateCount = 3,
+        .pDynamicStates = shadow_states,
+    };
+    VkGraphicsPipelineCreateInfo shadow_info = info;
+    shadow_info.pNext = &rendering_info;
+    shadow_info.stageCount = 1;
+    shadow_info.pStages = &shadow_stage;
+    shadow_info.pVertexInputState = &shadow_input;
+    shadow_info.pRasterizationState = &shadow_raster;
+    shadow_info.pColorBlendState = nullptr;
+    shadow_info.pDynamicState = &shadow_dynamic;
+    shadow_info.renderPass = VK_NULL_HANDLE;
+    const VkResult shadow_result = vkCreateGraphicsPipelines(c.device, VK_NULL_HANDLE, 1,
+                                                            &shadow_info, nullptr, &shadow_pipeline);
+    vkDestroyShaderModule(c.device, shadow_vs, nullptr);
+    check(shadow_result, "Cannot create shadow graphics pipeline");
+
     // маркеры используют отдельные шейдеры без расчёта освещения
     const VkPipelineLayoutCreateInfo marker_layout_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
@@ -635,6 +803,84 @@ void makePipeline() {
     check(line_result, "Cannot create line graphics pipeline");
 }
 
+void drawScene(VkCommandBuffer command, VkExtent2D extent, bool depth_only) {
+    vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_GRAPHICS, depth_only ? shadow_pipeline : pipeline);
+    const VkViewport viewport = {0, 0, float(extent.width), float(extent.height), 0, 1};
+    const VkRect2D scissor = {{0, 0}, extent};
+    vkCmdSetViewport(command, 0, 1, &viewport);
+    vkCmdSetScissor(command, 0, 1, &scissor);
+
+    const VkDeviceSize offset = 0;
+    vkCmdBindVertexBuffers(command, 0, 1, &vertex_buffer.buffer, &offset);
+    vkCmdBindIndexBuffer(command, index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
+    vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
+                            0, 1, &descriptor_set, 0, nullptr);
+
+    for (uint32_t i = 0; i <= floor_model; ++i) {
+        const bool is_floor = i == floor_model;
+        const VkDescriptorSet material = material_sets[is_floor ? grass_material : model_textures[i]];
+        const uint32_t dynamic_offset = uint32_t(model_stride * i);
+        vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_GRAPHICS, layout,
+                                1, 1, &material, 1, &dynamic_offset);
+        if (!depth_only) {
+            const SamplingPush sampling = {sampling_time, uint32_t(i == 0 && animated_sampling)};
+            vkCmdPushConstants(command, layout, VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(sampling), &sampling);
+        }
+        const uint32_t first_index = is_floor ? floor_first_index : 0;
+        const uint32_t index_count = is_floor ? uint32_t(indices.size()) - floor_first_index : floor_first_index;
+        vkCmdDrawIndexed(command, index_count, 1, first_index, 0, 0);
+    }
+}
+
+void renderShadowMap(VkCommandBuffer command) {
+    constexpr VkPipelineStageFlags depth_stages = VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
+    const bool first_frame = shadow_map_layout == VK_IMAGE_LAYOUT_UNDEFINED;
+    VkImageMemoryBarrier barrier = {
+        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+        .srcAccessMask = first_frame ? VkAccessFlags(0) : VK_ACCESS_SHADER_READ_BIT,
+        .dstAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+        .oldLayout = shadow_map_layout,
+        .newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+        .image = shadow_map.image,
+        .subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1},
+    };
+    vkCmdPipelineBarrier(command, first_frame ? VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT :
+                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         depth_stages, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+
+    const VkRenderingAttachmentInfo depth_attachment = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = shadow_map.view,
+        .imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+        .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+        .clearValue = {.depthStencil = {1.0f, 0}},
+    };
+    const VkRenderingInfo rendering = {
+        .sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
+        .renderArea = {{0, 0}, shadow_extent},
+        .layerCount = 1,
+        .pDepthAttachment = &depth_attachment,
+    };
+    vkCmdBeginRendering(command, &rendering);
+    vkCmdSetDepthBias(command, shadow_depth_bias, 0.0f, 1.5f);
+    drawScene(command, shadow_extent, true);
+    vkCmdEndRendering(command);
+
+    shadow_map_layout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    barrier.newLayout = shadow_map_layout;
+    vkCmdPipelineBarrier(command, depth_stages, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+
 } // namespace
 
 bool initialize() {
@@ -642,10 +888,12 @@ bool initialize() {
 
     gpu::initialize();
     buildCone();
+    buildFloor();
     vertex_buffer = gpu::uploadBuffer(vertices.data(), vertices.size() * sizeof(Vertex),
                                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     index_buffer = gpu::uploadBuffer(indices.data(), indices.size() * sizeof(uint32_t),
                                      VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    createShadowMap();
     black_texture = gpu::loadTexture("textures/black.png", VK_FORMAT_R8G8B8A8_UNORM);
     for (uint32_t i = 0; i < texture_count; ++i) {
         textures[i] = gpu::loadTexture(texture_paths[i]);
@@ -676,18 +924,25 @@ bool initialize() {
     vkGetPhysicalDeviceProperties(c.physical_device, &properties);
     const VkDeviceSize alignment = properties.limits.minUniformBufferOffsetAlignment;
     model_stride = (sizeof(Transform) + alignment - 1) / alignment * alignment;
-    createMappedBuffer(model_buffer, model_stride * model_count, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    createMappedBuffer(model_buffer, model_stride * (floor_model + 1), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    const Transform floor_transform = {
+        {{1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1}},
+        {0, 0, 0, 1},
+    };
+    std::memcpy(static_cast<char*>(model_buffer.data) + model_stride * floor_model,
+                 &floor_transform, sizeof(floor_transform));
 
-    // set 0 содержит общие данные сцены и два массива источников света
+    // set 0 содержит общие данные сцены, источники света и карту теней.
     const VkDescriptorSetLayoutBinding bindings[] = {
         {0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1,
          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
         {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {3, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
     };
     const VkDescriptorSetLayoutCreateInfo descriptor_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
-        .bindingCount = 3,
+        .bindingCount = 4,
         .pBindings = bindings,
     };
     check(vkCreateDescriptorSetLayout(c.device, &descriptor_info, nullptr, &descriptor_layout),
@@ -713,7 +968,7 @@ bool initialize() {
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 2},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, texture_count},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_count * 3},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, texture_count * 3 + 1},
     };
     const VkDescriptorPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
@@ -740,6 +995,7 @@ bool initialize() {
 
     writeBufferDescriptor(descriptor_set, 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
                           uniform_buffer, sizeof(SceneData));
+    writeTextureDescriptor(descriptor_set, 3, shadow_map, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
     for (uint32_t i = 0; i < texture_count; ++i) {
         material_sets[i] = sets[i + 1];
         writeBufferDescriptor(material_sets[i], 0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,
@@ -765,6 +1021,7 @@ void shutdown() {
     vkQueueWaitIdle(c.graphics_queue);
 
     vkDestroyPipeline(c.device, pipeline, nullptr);
+    vkDestroyPipeline(c.device, shadow_pipeline, nullptr);
     vkDestroyPipeline(c.device, marker_pipeline, nullptr);
     vkDestroyPipeline(c.device, line_pipeline, nullptr);
     vkDestroyPipelineLayout(c.device, layout, nullptr);
@@ -785,6 +1042,7 @@ void shutdown() {
     for (gpu::Texture& texture : emissive_textures)
         gpu::destroy(texture);
     gpu::destroy(black_texture);
+    gpu::destroy(shadow_map);
 
     vmaUnmapMemory(c.allocator, uniform_allocation);
     vmaDestroyBuffer(c.allocator, uniform_buffer, uniform_allocation);
@@ -807,7 +1065,14 @@ void update(double time) {
 
     ImGui::SetNextWindowPos(ImVec2(15, 15), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(440, 650), ImGuiCond_FirstUseEver);
-    ImGui::Begin("Texturing - lab 3");
+    ImGui::Begin("Shadow mapping - lab 4");
+
+    if (ImGui::CollapsingHeader("Shadows", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::SliderFloat("Ortho size", &shadow_area_width, 2.0f, 30.0f,
+                           "%.1f", ImGuiSliderFlags_AlwaysClamp);
+        ImGui::SliderFloat("Depth bias", &shadow_depth_bias, 0.0f, 12.0f,
+                           "%.2f", ImGuiSliderFlags_AlwaysClamp);
+    }
 
     if (ImGui::CollapsingHeader("Textures", ImGuiTreeNodeFlags_DefaultOpen)) {
         ImGui::Combo("Selected model", &selected_model, "Cone 1\0Cone 2\0");
@@ -833,9 +1098,11 @@ void update(double time) {
         if (far_plane < near_plane + 0.1f) far_plane = near_plane + 0.1f;
 
         if (ImGui::Button("Reset camera")) {
-            camera_position[0] = camera_position[1] = 0.0f;
-            camera_position[2] = 4.5f;
-            camera_rotation_deg[0] = camera_rotation_deg[1] = camera_rotation_deg[2] = 0.0f;
+            camera_position[0] = 0.0f;
+            camera_position[1] = initial_camera_height;
+            camera_position[2] = initial_camera_distance;
+            camera_rotation_deg[0] = initial_camera_pitch;
+            camera_rotation_deg[1] = camera_rotation_deg[2] = 0.0f;
             camera_fov = 50.0f;
             near_plane = 0.1f;
             far_plane = 100.0f;
@@ -958,31 +1225,6 @@ void render(const graphics::internal::FrameData& fd) {
     };
     check(vkBeginCommandBuffer(fd.command_buffer, &begin), "Cannot begin command buffer");
 
-    VkClearValue clear[2] = {};
-    clear[0].color = {{0.08f, 0.10f, 0.14f, 1}};
-    clear[1].depthStencil = {1, 0};
-    const VkRenderPassBeginInfo pass = {
-        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
-        .renderPass = c.render_pass,
-        .framebuffer = fd.framebuffer,
-        .renderArea = {{0, 0}, c.swapchain_extent},
-        .clearValueCount = 2,
-        .pClearValues = clear,
-    };
-    vkCmdBeginRenderPass(fd.command_buffer, &pass, VK_SUBPASS_CONTENTS_INLINE);
-
-    // подключаем конвейер и геометрию конуса
-    vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    const VkDeviceSize offset = 0;
-    vkCmdBindVertexBuffers(fd.command_buffer, 0, 1, &vertex_buffer.buffer, &offset);
-    vkCmdBindIndexBuffer(fd.command_buffer, index_buffer.buffer, 0, VK_INDEX_TYPE_UINT32);
-
-    const VkViewport viewport = {0, 0, float(c.swapchain_extent.width),
-                                 float(c.swapchain_extent.height), 0, 1};
-    const VkRect2D scissor = {{0, 0}, c.swapchain_extent};
-    vkCmdSetViewport(fd.command_buffer, 0, 1, &viewport);
-    vkCmdSetScissor(fd.command_buffer, 0, 1, &scissor);
-
     for (uint32_t i = 0; i < model_count; ++i) {
         Matrix4 model = rotationMatrix(object_rotations[i]);
         for (int column = 0; column < 3; ++column)
@@ -1005,6 +1247,7 @@ void render(const graphics::internal::FrameData& fd) {
         {light_color[0], light_color[1], light_color[2], 0.0f},
         {ambient_color[0], ambient_color[1], ambient_color[2], ambient_intensity},
         {uint32_t(point_lights.size()), uint32_t(spot_lights.size()), 0, 0},
+        makeLightViewProjection(),
     };
 
     // prepare() дождался предыдущего кадра: можно обновлять и заменять буферы
@@ -1016,17 +1259,23 @@ void render(const graphics::internal::FrameData& fd) {
     check(vmaFlushAllocation(c.allocator, model_buffer.allocation, 0, model_buffer.size),
           "Cannot flush model uniform buffer");
 
-    for (uint32_t i = 0; i < model_count; ++i) {
-        const uint32_t dynamic_offset = uint32_t(model_stride * i);
-        const VkDescriptorSet sets[] = {descriptor_set, material_sets[model_textures[i]]};
-        vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                layout, 0, 2, sets, 1, &dynamic_offset);
-        const SamplingPush sampling = {sampling_time, uint32_t(i == 0 && animated_sampling)};
-        vkCmdPushConstants(fd.command_buffer, layout, VK_SHADER_STAGE_FRAGMENT_BIT,
-                            0, sizeof(sampling), &sampling);
-        vkCmdDrawIndexed(fd.command_buffer, uint32_t(indices.size()), 1, 0, 0, 0);
-    }
+    renderShadowMap(fd.command_buffer);
 
+    VkClearValue clear[2] = {};
+    clear[0].color = {{0.08f, 0.10f, 0.14f, 1}};
+    clear[1].depthStencil = {1, 0};
+    const VkRenderPassBeginInfo pass = {
+        .sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO,
+        .renderPass = c.render_pass,
+        .framebuffer = fd.framebuffer,
+        .renderArea = {{0, 0}, c.swapchain_extent},
+        .clearValueCount = 2,
+        .pClearValues = clear,
+    };
+    vkCmdBeginRenderPass(fd.command_buffer, &pass, VK_SUBPASS_CONTENTS_INLINE);
+    drawScene(fd.command_buffer, c.swapchain_extent, false);
+
+    const VkDeviceSize offset = 0;
     if (!marker_vertices.empty()) {
         vkCmdBindPipeline(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, marker_pipeline);
         vkCmdBindDescriptorSets(fd.command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS,

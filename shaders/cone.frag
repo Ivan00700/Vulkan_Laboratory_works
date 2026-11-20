@@ -13,7 +13,10 @@ layout(set = 0, binding = 0, std140) uniform Scene {
     vec4 lightColor;
     vec4 ambient;
     uvec4 lightCounts;
+    mat4 lightViewProjection;
 } scene;
+
+layout(set = 0, binding = 3) uniform sampler2DShadow shadowMap;
 
 layout(set = 1, binding = 0, std140) uniform Model {
     mat4 model;
@@ -77,6 +80,17 @@ vec3 blinnPhong(vec3 N, vec3 L, vec3 V, vec3 albedo, vec3 specularMask) {
     return albedo * diffuse + transform.specularShininess.rgb * specularMask * specular;
 }
 
+float sunlightVisibility() {
+    vec4 lightClip = scene.lightViewProjection * vec4(worldPosition, 1.0);
+    vec3 lightNdc = lightClip.xyz / lightClip.w;
+    vec2 uv = lightNdc.xy * 0.5 + 0.5;
+    if (any(lessThan(uv, vec2(0.0))) || any(greaterThanEqual(uv, vec2(1.0))) ||
+        lightNdc.z < 0.0 || lightNdc.z >= 1.0)
+        return 1.0;
+
+    return textureLod(shadowMap, vec3(uv, lightNdc.z), 0.0);
+}
+
 void main() {
     vec3 N = safeNormalize(normal);
     vec3 V = safeNormalize(scene.cameraPositionFov.xyz - worldPosition);
@@ -88,7 +102,8 @@ void main() {
 
     // направление к источнику противоположно направлению его лучей
     vec3 L = safeNormalize(-scene.lightDirectionIntensity.xyz);
-    result += scene.lightColor.rgb * scene.lightDirectionIntensity.w * blinnPhong(N, L, V, albedo, specularMask);
+    result += sunlightVisibility() * scene.lightColor.rgb * scene.lightDirectionIntensity.w *
+              blinnPhong(N, L, V, albedo, specularMask);
 
     for (uint i = 0; i < scene.lightCounts.x; ++i) {
         PointLight light = pointLights[i];
